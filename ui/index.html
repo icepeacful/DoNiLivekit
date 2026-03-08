@@ -315,6 +315,18 @@
     let remoteAudioContext = null;
     const remoteAudioGainNodes = {};
 
+    function normalizeGainValue(rawValue) {
+        const n = Number(rawValue);
+        if (!Number.isFinite(n)) return 1;
+        // Support both legacy 0~3 and current 0~300 slider formats.
+        const gain = n > 3 ? (n / 100) : n;
+        return Math.max(0, Math.min(gain, 3));
+    }
+
+    function gainToPercent(gain) {
+        return Math.round(Math.max(0, Math.min(gain, 3)) * 100);
+    }
+
     function isScreenShareSource(source) {
         return source === LivekitClient.Track.Source.ScreenShare || source === 'screen_share';
     }
@@ -413,28 +425,62 @@
         if (remoteAudioContext && remoteAudioContext.state === 'suspended') {
             remoteAudioContext.resume().catch(() => {});
         }
+        return !!remoteAudioContext;
     }
 
-    function addRemoteGainNode(identity, source, audioEl) {
+    function addRemoteGainNode(identity, source, track, audioEl) {
+        const gain = userVolumes[identity] && userVolumes[identity][source] !== undefined ? userVolumes[identity][source] : 1;
         ensureAudioContext();
-        if (!remoteAudioContext) return;
-        if (!audioEl.__gainAttached) {
-            const srcNode = remoteAudioContext.createMediaElementSource(audioEl);
+        if (!remoteAudioContext) {
+            audioEl.volume = Math.max(0, Math.min(gain, 1));
+            return;
+        }
+
+        const mediaTrack = track && track.mediaStreamTrack;
+        if (!mediaTrack) return;
+
+        try {
+            const streamSource = remoteAudioContext.createMediaStreamSource(new MediaStream([mediaTrack]));
             const gainNode = remoteAudioContext.createGain();
-            srcNode.connect(gainNode).connect(remoteAudioContext.destination);
+            streamSource.connect(gainNode);
+            gainNode.connect(remoteAudioContext.destination);
+
             audioEl.__gainAttached = true;
             audioEl.__gainNode = gainNode;
+            audioEl.__streamSource = streamSource;
+            audioEl.__trackSid = track.sid;
+            gainNode.gain.value = gain;
+        } catch (e) {
+            audioEl.volume = Math.max(0, Math.min(gain, 1));
+            return;
         }
 
         const key = `${identity}:${source}`;
         if (!remoteAudioGainNodes[key]) remoteAudioGainNodes[key] = [];
-        remoteAudioGainNodes[key].push(audioEl.__gainNode);
-        const gain = userVolumes[identity] && userVolumes[identity][source] !== undefined ? userVolumes[identity][source] : 1;
-        audioEl.__gainNode.gain.value = gain;
+        remoteAudioGainNodes[key].push(audioEl);
     }
 
     function clearRemoteGainNodes() {
-        Object.keys(remoteAudioGainNodes).forEach(key => delete remoteAudioGainNodes[key]);
+        Object.keys(remoteAudioGainNodes).forEach(key => {
+            remoteAudioGainNodes[key].forEach((audioEl) => {
+                try { audioEl.__streamSource && audioEl.__streamSource.disconnect(); } catch (_) {}
+                try { audioEl.__gainNode && audioEl.__gainNode.disconnect(); } catch (_) {}
+            });
+            delete remoteAudioGainNodes[key];
+        });
+    }
+
+    function removeRemoteAudioRouteByTrackSid(trackSid) {
+        if (!trackSid) return;
+        Object.keys(remoteAudioGainNodes).forEach((key) => {
+            remoteAudioGainNodes[key] = remoteAudioGainNodes[key].filter((audioEl) => {
+                if (audioEl.__trackSid !== trackSid) return true;
+                try { audioEl.__streamSource && audioEl.__streamSource.disconnect(); } catch (_) {}
+                try { audioEl.__gainNode && audioEl.__gainNode.disconnect(); } catch (_) {}
+                return false;
+            });
+            if (remoteAudioGainNodes[key].length === 0) delete remoteAudioGainNodes[key];
+        });
     }
 
     function renderChannelList() {
@@ -480,13 +526,24 @@
     }
 
     function setParticipantVolume(identity, source, volumeValue) {
+        ensureAudioContext();
         if (!userVolumes[identity]) {
             userVolumes[identity] = { mic: 1, screen: 1 };
         }
-        userVolumes[identity][source] = parseFloat(volumeValue);
+        userVolumes[identity][source] = normalizeGainValue(volumeValue);
         const key = `${identity}:${source}`;
+        const gain = userVolumes[identity][source];
         const gains = remoteAudioGainNodes[key] || [];
-        gains.forEach(node => { node.gain.value = userVolumes[identity][source]; });
+        gains.forEach((audioEl) => {
+            if (audioEl.__gainNode) audioEl.__gainNode.gain.value = gain;
+        });
+
+        // Fallback: if GainNode chain is unavailable, still allow native element volume control.
+        document.querySelectorAll(`[data-audio-identity="${identity}"][data-audio-source="${source}"]`).forEach((audioEl) => {
+            if (!audioEl.__gainAttached) {
+                audioEl.volume = Math.max(0, Math.min(gain, 1));
+            }
+        });
     }
 
     function getMicCaptureOptions() {
@@ -515,12 +572,12 @@
             let volumeControlsHTML = '';
             if (!isSelf) {
                 const micVol = userVolumes[p.identity].mic;
-                volumeControlsHTML += `<div style="display: flex; align-items: center; gap: 5px; font-size: 12px;"><span title="麦克风音量">🎤</span><input type="range" class="volume-slider" min="0" max="3" step="0.05" value="${micVol}" oninput="setParticipantVolume('${p.identity}', 'mic', this.value);this.nextElementSibling.innerText=Math.round(this.value*100)+'%'"><span style="width:38px; text-align:right; color:#b5bac1;">${Math.round(micVol*100)}%</span></div>`;
+                volumeControlsHTML += `<div style="display: flex; align-items: center; gap: 5px; font-size: 12px;"><span title="麦克风音量">🎤</span><input type="range" class="volume-slider" min="0" max="300" step="1" value="${gainToPercent(micVol)}" oninput="setParticipantVolume('${p.identity}', 'mic', this.value);this.nextElementSibling.innerText=this.value+'%'"><span style="width:38px; text-align:right; color:#b5bac1;">${gainToPercent(micVol)}%</span></div>`;
                 
                 const hasScreenAudio = Array.from(p.audioTrackPublications.values()).some(pub => pub.source === LivekitClient.Track.Source.ScreenShareAudio || pub.source === 'screen_share_audio');
                 if (hasScreenAudio) {
                     const screenVol = userVolumes[p.identity].screen;
-                    volumeControlsHTML += `<div style="display: flex; align-items: center; gap: 5px; font-size: 12px;"><span title="共享音量">💻</span><input type="range" class="volume-slider" min="0" max="3" step="0.05" value="${screenVol}" oninput="setParticipantVolume('${p.identity}', 'screen', this.value);this.nextElementSibling.innerText=Math.round(this.value*100)+'%'"><span style="width:38px; text-align:right; color:#b5bac1;">${Math.round(screenVol*100)}%</span></div>`;
+                    volumeControlsHTML += `<div style="display: flex; align-items: center; gap: 5px; font-size: 12px;"><span title="共享音量">💻</span><input type="range" class="volume-slider" min="0" max="300" step="1" value="${gainToPercent(screenVol)}" oninput="setParticipantVolume('${p.identity}', 'screen', this.value);this.nextElementSibling.innerText=this.value+'%'"><span style="width:38px; text-align:right; color:#b5bac1;">${gainToPercent(screenVol)}%</span></div>`;
                 }
             }
 
@@ -577,6 +634,9 @@
     async function joinRoom() {
         const username = document.getElementById('username').value.trim();
         if (!username) return alert('起个响亮的名字吧！');
+
+        // join button is a user gesture, use it to unlock audio context when needed.
+        ensureAudioContext();
 
         localStorage.setItem('lk_username', username);
         const serverConfig = getServerConfig();
@@ -687,6 +747,9 @@
 
                 } else if (track.kind === 'audio') {
                     const audioEl = track.attach();
+                    // Prevent double output from native <audio>; route sound only through AudioContext.
+                    audioEl.muted = true;
+                    audioEl.volume = 0;
                     audioEl.dataset.audioIdentity = participant.identity;
                     
                     const source = (track.source === LivekitClient.Track.Source.ScreenShareAudio || track.source === 'screen_share_audio') ? 'screen' : 'mic';
@@ -696,8 +759,7 @@
                         userVolumes[participant.identity] = { mic: 1, screen: 1 };
                     }
                     // 交给 GainNode 处理，支持 100% 以上的本地增益
-                    audioEl.volume = 1;
-                    addRemoteGainNode(participant.identity, source, audioEl);
+                    addRemoteGainNode(participant.identity, source, track, audioEl);
                     
                     document.getElementById('audio-container').appendChild(audioEl);
                 }
@@ -706,6 +768,7 @@
             // 🌟 核心修改：如果有人单独关掉了屏幕共享，要把他的包装盒一起删掉
             room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => {
                 track.detach().forEach(element => element.remove());
+                removeRemoteAudioRouteByTrackSid(track.sid);
                 
                 // 精准狙击并删除对应的包装盒
                 const wrapper = document.getElementById('video-wrapper-' + track.sid);
