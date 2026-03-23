@@ -48,9 +48,6 @@
                 <button id="btn-mic" class="action-btn" onclick="toggleMic()" disabled>
                     🎤 <span>开启麦克风</span>
                 </button>
-                <button id="btn-noise" class="action-btn" onclick="toggleNoiseSuppression()" disabled>
-                    🔊 <span>降噪: 开</span>
-                </button>
             </div>
 
             <div class="mic-control-group">
@@ -77,14 +74,32 @@
                 </button>
             </div>
 
-            <button id="btn-diagnose" class="action-btn" onclick="runAudioShareDiagnostics()">
-                🧪 <span>一键排查音频</span>
+            <button id="btn-app-audio" class="action-btn" onclick="openAppAudioModal()" disabled>
+                🎵 <span>共享应用音频</span>
+            </button>
+            <button id="btn-stop-app-audio" class="action-btn" onclick="stopAppAudioShare()" disabled>
+                ⏹️ <span>停止共享</span>
             </button>
             <button id="btn-leave" class="action-btn" onclick="leaveRoom()" style="display: none;">
                 🚪 <span>断开连接</span>
             </button>
         </div>
     </div>
+
+    <div id="app-audio-modal" class="modal hidden" onclick="closeAppAudioModal(event)">
+        <div class="modal-card" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <div class="modal-title">🎯 选择要共享音频的应用</div>
+                <button class="modal-close" onclick="closeAppAudioModal()">✕</button>
+            </div>
+            <div class="modal-subtitle">仅展示可识别名称的活跃进程，点击后将开始截流并推送到房间。</div>
+            <div id="app-audio-process-list" class="modal-list"></div>
+            <div class="modal-footer">
+                <button id="btn-confirm-app-audio" class="primary-btn" onclick="confirmAppAudioSelection()">开始共享所选应用</button>
+            </div>
+        </div>
+    </div>
+
     <div id="chat-panel">
         <div class="chat-header">💬 局域网聊天</div>
         <div id="chat-messages">

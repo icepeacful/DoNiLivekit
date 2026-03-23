@@ -23,3 +23,24 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.10.3", features = [] }
 tauri-plugin-log = "2"
+# 系统进程扫描雷达
+sysinfo = "0.30" 
+# 异步并发心脏
+tokio = { version = "1", features = ["full"] } 
+# 本地 WebSocket 高铁
+tokio-tungstenite = "0.20" 
+futures-util = "0.3" 
+# 微软官方 Windows 底层核武器
+[dependencies.windows]
+version = "0.52"
+features = [
+    "implement",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+]
