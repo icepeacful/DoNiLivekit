@@ -1,4 +1,8 @@
 const DEFAULT_SERVER_IP = '10.126.126.10:5000';
+const invoke = window.__TAURI__?.core?.invoke
+    ? (...args) => window.__TAURI__.core.invoke(...args)
+    : async () => { throw new Error('Tauri invoke 不可用，请在 Tauri 环境运行'); };
+
 let room;
 let currentChannel = null;
 let isInLobby = false;
@@ -7,7 +11,6 @@ const channelParticipants = {};
 let roomPollTimer = null;
 let isMicOn = false;
 let isScreenOn = false;
-let isNoiseSuppressionOn = true;
 const userVolumes = {}; 
 let screenBitrateMonitorTimer = null;
 let lastScreenOutboundStats = null;
@@ -15,6 +18,15 @@ let currentScreenTargetBitrate = 0;
 const localScreenControls = {};
 let currentLocalScreenTrack = null;
 let remoteAudioContext = null;
+let localPcmAudioContext = null;
+let localPcmWorkletNode = null;
+let localPcmDestination = null;
+let localPcmTrack = null;
+let localPcmSocket = null;
+let isLocalPcmPipelineReady = false;
+let localAppAudioPublication = null;
+let isAppAudioSharing = false;
+const selectedAppAudioPids = new Set();
 const remoteAudioGainNodes = {};
 const activeSpeakerIdentities = new Set();
 const activeSpeakerDebounceTimers = {};
@@ -114,18 +126,187 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const savedServerIp = localStorage.getItem('lk_server_ip');
     document.getElementById('server-ip').value = savedServerIp || DEFAULT_SERVER_IP;
-    
-    const savedNoise = localStorage.getItem('lk_noise');
-    if (savedNoise !== null) {
-        isNoiseSuppressionOn = savedNoise === 'true';
-        const btn = document.getElementById('btn-noise');
-        btn.innerHTML = isNoiseSuppressionOn ? '🔊 <span>降噪: 开</span>' : '📢 <span>降噪: 关</span>';
-        btn.classList.toggle('active', !isNoiseSuppressionOn);
-    }
 
     renderChannelList();
     updateAudioOutputList();
 });
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function startCaptureWithRetry(pid, maxAttempts = 8, intervalMs = 150) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await invoke('start_capture', { pid });
+        } catch (error) {
+            lastError = error;
+            const message = String(error?.message || error || '');
+            const isChannelNotReady = message.includes('channel closed');
+            if (!isChannelNotReady || attempt === maxAttempts) break;
+            await sleep(intervalMs);
+        }
+    }
+    throw lastError || new Error('start_capture 失败');
+}
+
+async function startCaptureMultiWithRetry(pids, maxAttempts = 8, intervalMs = 150) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await invoke('start_capture_multi', { pids });
+        } catch (error) {
+            lastError = error;
+            const message = String(error?.message || error || '');
+            const isChannelNotReady = message.includes('channel closed');
+            if (!isChannelNotReady || attempt === maxAttempts) break;
+            await sleep(intervalMs);
+        }
+    }
+    throw lastError || new Error('start_capture_multi 失败');
+}
+
+function updateAppAudioButtons() {
+    const shareBtn = document.getElementById('btn-app-audio');
+    const stopBtn = document.getElementById('btn-stop-app-audio');
+    if (!shareBtn || !stopBtn) return;
+
+    const connected = !!(room && room.localParticipant);
+    shareBtn.disabled = !connected || isAppAudioSharing;
+    stopBtn.disabled = !connected || !isAppAudioSharing;
+
+    if (isAppAudioSharing) {
+        shareBtn.classList.add('active');
+        shareBtn.innerHTML = '🎵 <span>正在共享应用音频</span>';
+    } else {
+        shareBtn.classList.remove('active');
+        shareBtn.innerHTML = '🎵 <span>共享应用音频</span>';
+    }
+}
+
+function closeAppAudioModal(event) {
+    if (event && event.target && event.target.id !== 'app-audio-modal') return;
+    const modal = document.getElementById('app-audio-modal');
+    if (modal) modal.classList.add('hidden');
+    selectedAppAudioPids.clear();
+}
+
+async function openAppAudioModal() {
+    if (!room || !room.localParticipant) {
+        alert('请先进入语音分组后再共享应用音频。');
+        return;
+    }
+
+    const modal = document.getElementById('app-audio-modal');
+    const listEl = document.getElementById('app-audio-process-list');
+    if (!modal || !listEl) return;
+
+    modal.classList.remove('hidden');
+    listEl.innerHTML = '<div class="modal-empty">正在扫描活跃进程...</div>';
+
+    try {
+        const processes = await invoke('get_active_processes');
+        const rows = (Array.isArray(processes) ? processes : []).filter((p) => {
+            const name = (p?.name || '').trim();
+            return name.length > 0;
+        });
+
+        if (rows.length === 0) {
+            listEl.innerHTML = '<div class="modal-empty">未发现可用进程，请先启动目标应用后重试。</div>';
+            return;
+        }
+
+        listEl.innerHTML = rows.map((p) => {
+            const safeName = sanitizeText(p.name);
+            const pid = Number(p.pid) || 0;
+            const mem = Number(p.memory_mb) || 0;
+            return `
+                <button id="process-item-${pid}" class="process-item" onclick="toggleAppAudioProcessSelection(${pid})" title="选择 ${safeName}">
+                    <span class="process-name">${safeName}</span>
+                    <span class="process-meta">PID ${pid} · ${mem} MB</span>
+                </button>
+            `;
+        }).join('');
+    } catch (error) {
+        console.error('获取活跃进程失败:', error);
+        listEl.innerHTML = `<div class="modal-empty">获取进程列表失败：${sanitizeText(error?.message || String(error))}</div>`;
+    }
+}
+
+function toggleAppAudioProcessSelection(pid) {
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    const item = document.getElementById(`process-item-${pid}`);
+    if (selectedAppAudioPids.has(pid)) {
+        selectedAppAudioPids.delete(pid);
+        if (item) item.classList.remove('selected');
+    } else {
+        selectedAppAudioPids.add(pid);
+        if (item) item.classList.add('selected');
+    }
+}
+
+async function confirmAppAudioSelection() {
+    const pids = Array.from(selectedAppAudioPids.values());
+    if (pids.length === 0) {
+        alert('请至少选择一个应用进程。');
+        return;
+    }
+
+    if (!room || !room.localParticipant) {
+        alert('房间未连接，无法共享应用音频。');
+        return;
+    }
+
+    const listEl = document.getElementById('app-audio-process-list');
+    if (listEl) {
+        listEl.innerHTML = '<div class="modal-empty">正在启动多应用音频截流并发布轨道，请稍候...</div>';
+    }
+
+    try {
+        if (localAppAudioPublication) {
+            try {
+                await room.localParticipant.unpublishTrack(localAppAudioPublication.track);
+            } catch (_) {}
+            localAppAudioPublication = null;
+        }
+
+        const realSampleRate = pids.length === 1
+            ? await startCaptureWithRetry(pids[0])
+            : await startCaptureMultiWithRetry(pids);
+
+        const track = await initLocalPcmPipeline(realSampleRate);
+        if (!track) throw new Error('未拿到 localPcmTrack');
+
+        await sleep(500);
+
+        localAppAudioPublication = await room.localParticipant.publishTrack(track, { name: 'app-audio' });
+        isAppAudioSharing = true;
+        updateAppAudioButtons();
+        closeAppAudioModal();
+    } catch (error) {
+        console.error('共享应用音频失败:', error);
+        alert(`共享应用音频失败：${error?.message || error}`);
+        isAppAudioSharing = false;
+        updateAppAudioButtons();
+    }
+}
+
+async function stopAppAudioShare() {
+    try {
+        if (room && room.localParticipant && localAppAudioPublication) {
+            await room.localParticipant.unpublishTrack(localAppAudioPublication.track);
+        }
+    } catch (error) {
+        console.warn('停止应用音频发布失败:', error);
+    } finally {
+        localAppAudioPublication = null;
+        isAppAudioSharing = false;
+        teardownLocalPcmPipeline();
+        closeAppAudioModal();
+        updateAppAudioButtons();
+    }
+}
 
 function normalizeServerInput(rawValue) {
     let val = (rawValue || '').trim();
@@ -163,6 +344,110 @@ function ensureAudioContext() {
         remoteAudioContext.resume().catch(() => {});
     }
     return !!remoteAudioContext;
+}
+
+function getLocalPcmTrack() {
+    return localPcmTrack;
+}
+
+async function initLocalPcmPipeline(sampleRate) {
+    const targetSampleRate = Number(sampleRate);
+    const resolvedSampleRate = Number.isFinite(targetSampleRate) && targetSampleRate >= 8000
+        ? Math.round(targetSampleRate)
+        : 48000;
+
+    if (isLocalPcmPipelineReady && localPcmAudioContext) {
+        const currentRate = Number(localPcmAudioContext.sampleRate || 0);
+        if (Math.round(currentRate) === resolvedSampleRate) {
+            return localPcmTrack;
+        }
+        teardownLocalPcmPipeline();
+    }
+
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) {
+        console.warn('当前环境不支持 AudioContext，无法初始化 PCM 管线');
+        return null;
+    }
+
+    try {
+        localPcmAudioContext = new Ctx({ sampleRate: resolvedSampleRate });
+        await localPcmAudioContext.audioWorklet.addModule('./pcm-worker.js');
+
+        localPcmWorkletNode = new AudioWorkletNode(localPcmAudioContext, 'pcm-ring-buffer-processor', {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+            processorOptions: {
+                capacityFrames: resolvedSampleRate * 10
+            }
+        });
+
+        localPcmDestination = localPcmAudioContext.createMediaStreamDestination();
+        localPcmWorkletNode.connect(localPcmDestination);
+        //localPcmWorkletNode.connect(localPcmAudioContext.destination);  这行代码是监听
+
+        const tracks = localPcmDestination.stream.getAudioTracks();
+        localPcmTrack = tracks.length > 0 ? tracks[0] : null;
+
+        localPcmSocket = new WebSocket('ws://127.0.0.1:9001');
+        localPcmSocket.binaryType = 'arraybuffer';
+
+        localPcmSocket.onopen = () => {
+            console.log('[PCM WS] 已连接 ws://127.0.0.1:9001');
+        };
+
+        localPcmSocket.onmessage = async (event) => {
+            if (!localPcmWorkletNode) return;
+            if (event.data instanceof ArrayBuffer) {
+                localPcmWorkletNode.port.postMessage(event.data, [event.data]);
+                return;
+            }
+            if (event.data instanceof Blob) {
+                const arr = await event.data.arrayBuffer();
+                localPcmWorkletNode.port.postMessage(arr, [arr]);
+            }
+        };
+
+        localPcmSocket.onerror = (err) => {
+            console.error('[PCM WS] 连接错误:', err);
+        };
+
+        localPcmSocket.onclose = () => {
+            console.warn('[PCM WS] 连接已关闭');
+        };
+
+        window.getLocalPcmTrack = getLocalPcmTrack;
+        isLocalPcmPipelineReady = true;
+        console.log(`[PCM] 管线已初始化(sampleRate=${resolvedSampleRate})，可通过 window.getLocalPcmTrack() 获取 MediaStreamTrack`);
+
+        return localPcmTrack;
+    } catch (error) {
+        console.error('[PCM] 管线初始化失败:', error);
+        return null;
+    }
+}
+
+function teardownLocalPcmPipeline() {
+    if (localPcmSocket) {
+        try { localPcmSocket.close(); } catch (_) {}
+        localPcmSocket = null;
+    }
+
+    if (localPcmWorkletNode) {
+        try { localPcmWorkletNode.disconnect(); } catch (_) {}
+        localPcmWorkletNode = null;
+    }
+
+    localPcmDestination = null;
+    localPcmTrack = null;
+
+    if (localPcmAudioContext) {
+        localPcmAudioContext.close().catch(() => {});
+        localPcmAudioContext = null;
+    }
+
+    isLocalPcmPipelineReady = false;
 }
 
 function addRemoteGainNode(identity, source, track, audioEl) {
@@ -327,7 +612,6 @@ function resetRoomUIAfterDisconnect() {
     document.getElementById('participant-list').innerHTML = '<div style="font-size: 12px; color: #80848e; text-align: center; margin-top: 20px;">加入频道后显示在线人员</div>';
     document.getElementById('user-count').innerText = '0';
     document.getElementById('btn-mic').disabled = true;
-    document.getElementById('btn-noise').disabled = true;
     document.getElementById('mic-select').disabled = true;
     document.getElementById('audio-output-select').disabled = true;
     document.getElementById('btn-screen').disabled = true;
@@ -336,12 +620,17 @@ function resetRoomUIAfterDisconnect() {
     document.getElementById('screen-bitrate').disabled = true;
     document.getElementById('chat-input').disabled = true;
     document.getElementById('btn-send').disabled = true;
+    document.getElementById('btn-app-audio').disabled = true;
+    document.getElementById('btn-stop-app-audio').disabled = true;
     isMicOn = false;
     isScreenOn = false;
+    isAppAudioSharing = false;
+    localAppAudioPublication = null;
     clearActiveSpeakerDebounceTimers();
     activeSpeakerIdentities.clear();
     clearRemoteGainNodes();
     hideLocalScreenPreview();
+    closeAppAudioModal();
 }
 
 function setParticipantVolume(identity, source, volumeValue) {
@@ -367,9 +656,9 @@ function setParticipantVolume(identity, source, volumeValue) {
 
 function getMicCaptureOptions() {
     return {
-        echoCancellation: isNoiseSuppressionOn,
-        noiseSuppression: isNoiseSuppressionOn,
-        autoGainControl: isNoiseSuppressionOn
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
     };
 }
 
@@ -514,6 +803,9 @@ async function joinRoom() {
 
     // join button is a user gesture, use it to unlock audio context when needed.
     ensureAudioContext();
+    if (localPcmAudioContext && localPcmAudioContext.state === 'suspended') {
+        localPcmAudioContext.resume().catch(() => {});
+    }
 
     localStorage.setItem('lk_username', username);
     const serverConfig = getServerConfig();
@@ -749,13 +1041,14 @@ async function connectToChannel(targetRoomName) {
         document.getElementById('username').disabled = true;
         
         document.getElementById('btn-mic').disabled = false;
-        document.getElementById('btn-noise').disabled = false;
         document.getElementById('mic-select').disabled = false;
         document.getElementById('audio-output-select').disabled = false;
         document.getElementById('btn-screen').disabled = false;
         document.getElementById('screen-res').disabled = false;
         document.getElementById('screen-fps').disabled = false;
         document.getElementById('screen-bitrate').disabled = false;
+        document.getElementById('btn-app-audio').disabled = false;
+        document.getElementById('btn-stop-app-audio').disabled = true;
         document.getElementById('btn-leave').style.display = 'flex';
 
         // 加入后自动开麦（失败仅记录，不中断进房流程）
@@ -776,6 +1069,7 @@ async function connectToChannel(targetRoomName) {
         await updateMicList();
         await updateAudioOutputList();
         await switchAudioOutput(document.getElementById('audio-output-select').value || selectedAudioOutputId);
+        updateAppAudioButtons();
 
     } catch (error) {
         console.error('频道连接失败:', error);
@@ -801,24 +1095,6 @@ async function toggleMic() {
     } else {
         btn.classList.remove('active');
         btn.innerHTML = '🎤 <span>开启麦克风</span>';
-    }
-}
-
-async function toggleNoiseSuppression() {
-    isNoiseSuppressionOn = !isNoiseSuppressionOn;
-    localStorage.setItem('lk_noise', isNoiseSuppressionOn);
-    const btn = document.getElementById('btn-noise');
-    btn.innerHTML = isNoiseSuppressionOn ? '🔊 <span>降噪: 开</span>' : '📢 <span>降噪: 关</span>';
-    btn.classList.toggle('active', !isNoiseSuppressionOn);
-
-    if (room && isMicOn) {
-        try {
-            await room.localParticipant.setMicrophoneEnabled(false);
-            await room.localParticipant.setMicrophoneEnabled(true, getMicCaptureOptions());
-        } catch (e) {
-            console.error('切换降噪失败:', e);
-            alert('切换降噪失败，请重试。');
-        }
     }
 }
 
@@ -985,83 +1261,6 @@ function startScreenBitrateMonitor(targetBitrate) {
     screenBitrateMonitorTimer = setInterval(logCurrentScreenBitrate, 2000);
 }
 
-async function runAudioShareDiagnostics() {
-    const btn = document.getElementById('btn-diagnose');
-    const oldHtml = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '⏳ <span>排查中...</span>';
-
-    const now = new Date();
-    const preflight = getSystemAudioPreflight();
-    const report = [];
-    report.push('【系统音频共享诊断报告】');
-    report.push(`时间: ${now.toLocaleString()}`);
-    report.push(`页面地址: ${location.href}`);
-    report.push(`SecureContext: ${window.isSecureContext}`);
-    report.push(`协议: ${location.protocol}`);
-    report.push(`浏览器UA: ${navigator.userAgent}`);
-    report.push(`支持 getDisplayMedia: ${!!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)}`);
-
-    if (preflight.issues.length > 0) {
-        report.push('预检问题:');
-        preflight.issues.forEach(item => report.push(`- ${item}`));
-    } else {
-        report.push('预检结果: 通过');
-    }
-
-    let probeSummary = '';
-    try {
-        if (!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)) throw new Error('NotSupportedError');
-
-        const stream = await navigator.mediaDevices.getDisplayMedia(getDisplayMediaConstraints(true));
-        const audioTracks = stream.getAudioTracks();
-        const videoTracks = stream.getVideoTracks();
-
-        report.push(`探测成功: videoTracks=${videoTracks.length}, audioTracks=${audioTracks.length}`);
-
-        if (audioTracks.length > 0) {
-            const t = audioTracks[0];
-            report.push(`音频轨道状态: readyState=${t.readyState}, enabled=${t.enabled}, muted=${t.muted}`);
-            probeSummary = '探测成功：浏览器可返回系统音频轨道。';
-        } else {
-            probeSummary = '探测完成：未返回音频轨道（通常是未勾选“分享系统音频”或环境限制）。';
-        }
-
-        stream.getTracks().forEach(track => track.stop());
-    } catch (err) {
-        const name = err?.name || 'UnknownError';
-        const message = err?.message || '';
-        report.push(`探测失败: ${name}${message ? ` - ${message}` : ''}`);
-
-        if (name === 'NotAllowedError') probeSummary = '探测失败：你取消了共享或未授权。';
-        else if (name === 'NotReadableError') probeSummary = '探测失败：系统音频源无法启动（驱动/占用/浏览器限制）。';
-        else probeSummary = `探测失败：${name}`;
-    }
-
-    report.push('建议动作:');
-    report.push('- 共享时选择“整个屏幕”并勾选“分享系统音频”');
-    report.push('- 关闭占用音频设备的软件（会议/录屏/音效增强）');
-    report.push('- Windows 播放设备属性中关闭“独占模式”');
-    report.push('- HTTP 场景下系统音频共享不稳定，优先改 HTTPS');
-
-    const reportText = report.join('\n');
-    console.log(reportText);
-
-    try {
-        if (navigator.clipboard && window.isSecureContext) {
-            await navigator.clipboard.writeText(reportText);
-            alert(`${probeSummary}\n\n诊断报告已复制到剪贴板，并输出在控制台。`);
-        } else {
-            alert(`${probeSummary}\n\n诊断报告已输出到控制台（F12 查看并复制）。`);
-        }
-    } catch {
-        alert(`${probeSummary}\n\n诊断报告已输出到控制台（F12 查看并复制）。`);
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = oldHtml;
-    }
-}
-
 async function toggleScreen() {
     if (!room) return;
 
@@ -1182,10 +1381,12 @@ async function toggleScreen() {
 }
 
 function leaveRoom() {
+    stopAppAudioShare();
     stopRoomPolling();
     stopScreenBitrateMonitor();
     hideLocalScreenPreview();
     if(room) room.disconnect();
+    teardownLocalPcmPipeline();
     window.location.reload(); 
 }
 
@@ -1222,3 +1423,25 @@ function renderChatMessage(sender, text, isSelf) {
     messagesDiv.appendChild(msgEl);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
+
+/*
+// Tauri v2 标准的 invoke 引入方式
+const { invoke } = window.__TAURI__.core;
+
+// 阶段一测试函数
+async function testRadar() {
+    try {
+        console.log(" Rust扫描进程...");
+        const processes = await invoke('get_active_processes');
+        
+        console.log("活跃进程：");
+        console.table(processes); // 以表格形式漂亮地打印出来
+        
+    } catch (error) {
+        console.error("扫描失败:", error);
+    }
+}
+
+// 页面加载后直接执行测试
+testRadar();
+*/

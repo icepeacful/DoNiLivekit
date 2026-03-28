@@ -186,6 +186,23 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .mic-control-group .action-btn:hover:not(:disabled) { background-color: #404249; }
 .mic-control-group .action-btn.active { background-color: #f23f42; }
 
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 200; }
+.modal.hidden { display: none; }
+.modal-card { width: min(720px, 92vw); max-height: 78vh; background: #2b2d31; border: 1px solid #3b3d44; border-radius: 12px; box-shadow: 0 20px 40px rgba(0,0,0,0.45); display: flex; flex-direction: column; overflow: hidden; }
+.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #3b3d44; }
+.modal-title { font-size: 15px; font-weight: 700; color: #f2f3f5; }
+.modal-close { width: 30px; height: 30px; border: none; border-radius: 6px; background: #404249; color: #fff; cursor: pointer; }
+.modal-close:hover { background: #5865f2; }
+.modal-subtitle { font-size: 12px; color: #b5bac1; padding: 10px 16px; border-bottom: 1px solid #3b3d44; }
+.modal-list { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.process-item { border: 1px solid #3b3d44; border-radius: 8px; background: #313338; color: #dbdee1; cursor: pointer; padding: 10px 12px; text-align: left; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.process-item:hover { border-color: #5865f2; background: #36393f; }
+.process-item.selected { border-color: #5865f2; background: rgba(88, 101, 242, 0.22); }
+.process-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.process-meta { font-size: 12px; color: #b5bac1; flex-shrink: 0; }
+.modal-empty { color: #80848e; font-size: 13px; text-align: center; padding: 24px; }
+.modal-footer { display: flex; justify-content: flex-end; padding: 12px 16px; border-top: 1px solid #3b3d44; }
+
 @media (max-width: 1200px) {
     #controls-bar { justify-content: flex-start; }
 }
