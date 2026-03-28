@@ -131,6 +131,30 @@ document.addEventListener('DOMContentLoaded', () => {
     updateAudioOutputList();
 });
 
+function bind_channel_context_menu() {
+    document.querySelectorAll("div.channel-row").forEach(element => {
+        element.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+
+            const contextmenu = element.querySelector(".channel-context-menu");
+            contextmenu.classList.add('menu-active');
+
+            contextmenu.style.left = event.clientX + 'px';
+            contextmenu.style.top = event.clientY + 'px';
+            contextmenu.style.zIndex = '1000';
+
+            contextmenu.innerHTML = `<button onclick="deleteChannel('${element.id}')">删除频道</button>`;
+
+            // 点击其他地方关闭菜单
+            const closeMenu = () => {
+                contextmenu.classList.remove('menu-active');
+                document.removeEventListener('click', closeMenu);
+            };
+            document.addEventListener('click', closeMenu);
+        });
+    });
+}
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -517,12 +541,15 @@ function renderChannelList() {
             : '暂无在线成员';
         const participantsClass = participants.length > 0 ? 'channel-participants' : 'channel-participants empty';
         return `
-            <div class="channel-row">
+            <div id="${escapedName}" class="channel-row">
                 <button class="channel-item ${active}" onclick="switchChannel('${escapedName}')"># ${sanitizeText(name)}</button>
+                <div class="channel-context-menu"></div>
                 <div class="${participantsClass}">${participantsHTML}</div>
             </div>
         `;
     }).join('');
+
+    bind_channel_context_menu();
 }
 
 function sanitizeText(value) {
@@ -603,6 +630,34 @@ async function createChannel() {
     } catch (e) {
         console.error('创建房间失败:', e);
         alert(e.message || '创建房间失败，请稍后重试。');
+    }
+}
+
+async function deleteChannel(name) {
+    console.log('delete channel', name)
+    if (!name) return;
+    const isConfirmed = confirm("确定要执行删除操作吗？此操作不可撤销。");
+    if (isConfirmed) {
+        const serverConfig = getServerConfig();
+        const action = {
+            "action": "delete_channel",
+            "name": name
+        };
+        try {
+            const response = await fetch(`${serverConfig.apiBase}/api/rooms`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(action)
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || '删除房间失败');
+            }
+            await refreshRoomsFromServer();
+        } catch (e) {
+            console.error('删除房间失败:', e);
+            alert(e.message || '删除房间失败，请稍后重试。');
+        }
     }
 }
 

@@ -57,6 +57,15 @@ def add_room_to_db(room_name: str):
     finally:
         conn.close()
 
+def del_room_from_db(room_name: str):
+    conn = get_db_conn()
+    try:
+        print("delete")
+        conn.execute('DELETE FROM rooms WHERE room_name = ?', (room_name,))
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def list_livekit_rooms_and_participants():
     """使用最新版 LiveKitAPI 和 asyncio 语法的标准请求"""
@@ -114,17 +123,25 @@ def get_token():
 
 
 @app.route('/api/rooms', methods=['POST'])
-def create_room():
+def process_room():
     body = request.get_json(silent=True) or {}
+    action = body.get('action', '')
     room_name = (body.get('name') or body.get('room_name') or '').strip()
 
+    if not action:
+        return jsonify({'error': '缺少 action 字段'}), 400
     if not room_name:
         return jsonify({'error': '房间名不能为空'}), 400
     if len(room_name) > 64:
         return jsonify({'error': '房间名过长（最多64字符）'}), 400
-
-    add_room_to_db(room_name)
-    return jsonify({'ok': True, 'name': room_name})
+    
+    if action == "create_channel":
+        add_room_to_db(room_name)
+        return jsonify({'ok': True, 'name': room_name})
+    elif action == "delete_channel":
+        del_room_from_db(room_name)
+        return jsonify({'ok': True, 'name': room_name})
+    return jsonify({'error': '未知的 action 类型'}), 400
 
 
 @app.route('/api/rooms', methods=['GET'])
